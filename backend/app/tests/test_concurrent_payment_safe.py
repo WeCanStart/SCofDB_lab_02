@@ -205,7 +205,6 @@ async def test_concurrent_payment_safe_with_explicit_timing(test_order):
     """
     order_id = test_order
 
-    # локальный engine специально для теста: pool_size >= 2 и READ COMMITTED для предсказуемых блокировок
     engine = create_async_engine(
         DATABASE_URL,
         echo=True,
@@ -243,7 +242,6 @@ async def test_concurrent_payment_safe_with_explicit_timing(test_order):
             for r in rows:
                 print(r)
 
-            # blocking relationships for our two pids (if known)
             if pids["t1_pid"] or pids["t2_pid"]:
                 bq = text("""
                     SELECT pid, pg_blocking_pids(pid) AS blockers, state, query
@@ -261,15 +259,12 @@ async def test_concurrent_payment_safe_with_explicit_timing(test_order):
     async def attempt1():
         """Первая транзакция: берет FOR UPDATE, держит 1s, делает UPDATE+history, коммит."""
         times["t1_start"] = time.time()
-        # BEGIN
         async with session1.begin():
-            # backend pid & isolation
             pid = (await session1.execute(text("SELECT pg_backend_pid()"))).scalar_one()
             iso = (await session1.execute(text("SELECT current_setting('transaction_isolation')"))).scalar_one()
             pids["t1_pid"] = pid
             print(f"[T1] pid={pid} isolation={iso} t={time.time():.6f}")
 
-            # SELECT FOR UPDATE (we record time AFTER fetchone())
             print(f"[T1] before SELECT FOR UPDATE {time.time():.6f}")
             res = await session1.execute(
                 text("SELECT status FROM orders WHERE id = :order_id FOR UPDATE"),
@@ -278,10 +273,8 @@ async def test_concurrent_payment_safe_with_explicit_timing(test_order):
             row = res.fetchone()
             times["t1_acquired"] = time.time()
             print(f"[T1] after fetch (lock acquired?) {times['t1_acquired']:.6f} row={row}")
-            # dump locks snapshot while holding lock
             await dump_locks("after T1 acquired")
 
-            # hold lock for 1 second (simulate long processing)
             await asyncio.sleep(1.0)
 
             print(f"[T1] before UPDATE {time.time():.6f}")
@@ -297,11 +290,9 @@ async def test_concurrent_payment_safe_with_explicit_timing(test_order):
                 {"order_id": order_id}
             )
             print(f"[T1] ready to commit {time.time():.6f}")
-        # COMMIT happens when exiting async with
         times["t1_end"] = time.time()
         print(f"[T1] committed at {times['t1_end']:.6f}")
 
-        # dump locks after commit
         await dump_locks("after T1 commit")
         return "OK-1"
 
@@ -316,7 +307,6 @@ async def test_concurrent_payment_safe_with_explicit_timing(test_order):
                 pids["t2_pid"] = pid
                 print(f"[T2] pid={pid} isolation={iso} t={time.time():.6f}")
 
-                # dump locks BEFORE issuing second SELECT (snapshot)
                 await dump_locks("before T2 SELECT")
 
                 print(f"[T2] before SELECT FOR UPDATE {time.time():.6f}")
@@ -328,15 +318,12 @@ async def test_concurrent_payment_safe_with_explicit_timing(test_order):
                 times["t2_acquired"] = time.time()
                 print(f"[T2] after fetch (lock acquired?) {times['t2_acquired']:.6f} row={row}")
 
-                # dump locks after T2 fetch
                 await dump_locks("after T2 acquired")
 
                 if not row:
                     raise AssertionError("order not found in attempt2")
-                # if row shows paid already -> raise
                 if row[0] != "created":
                     raise OrderAlreadyPaidError(order_id)
-                # otherwise try to update (unexpected in this test)
                 await session2.execute(
                     text("UPDATE orders SET status = 'paid' WHERE id = :order_id AND status = 'created'"),
                     {"order_id": order_id}
@@ -344,38 +331,31 @@ async def test_concurrent_payment_safe_with_explicit_timing(test_order):
         except Exception as e:
             times["t2_end"] = time.time()
             print(f"[T2] ended with exception at {times['t2_end']:.6f}: {type(e).__name__}: {e!r}")
-            # return exception to caller to assert on it
             return e
         else:
             times["t2_end"] = time.time()
             print(f"[T2] finished normally at {times['t2_end']:.6f}")
             return "OK-2"
 
-    # запустим обе задачи параллельно
     task1 = asyncio.create_task(attempt1())
     task2 = asyncio.create_task(attempt2())
 
     results = await asyncio.gather(task1, task2, return_exceptions=True)
 
-    # clean up
     await session1.close()
     await session2.close()
     await engine.dispose()
 
-    # распечатаем для удобства
     print("TIMES:", times)
     print("PIDS:", pids)
     print("Results:", results)
 
     res1, res2 = results
 
-    # проверки
     assert res1 == "OK-1", f"attempt1 unexpected result: {res1!r}"
-    # ожидаем, что вторая вернёт OrderAlreadyPaidError (или другое исключение означающее, что увидела paid)
     assert isinstance(res2, OrderAlreadyPaidError) or (isinstance(res2, Exception) and isinstance(res2, OrderAlreadyPaidError.__class__)), \
         f"attempt2 expected OrderAlreadyPaidError, got: {res2!r}"
 
-    # тайминги: вторая должна завершиться позже первой и задержка >= 1s
     assert times["t1_end"] is not None and times["t2_end"] is not None, "timestamps missing"
     assert times["t2_end"] > times["t1_end"], "attempt2 finished before attempt1 (unexpected)"
     wait_time = times["t2_acquired"] - times["t2_start"]

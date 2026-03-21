@@ -72,7 +72,6 @@ class PaymentService:
             if current_status != "created":
                 raise OrderAlreadyPaidError(order_id)
             
-            # ВАЖНО: Нет проверки rowcount, чтобы разрешить гонку данных
             await self.session.execute(
                 text("UPDATE orders SET status = 'paid' WHERE id = :order_id AND status = 'created'"),
                 {"order_id": order_id}

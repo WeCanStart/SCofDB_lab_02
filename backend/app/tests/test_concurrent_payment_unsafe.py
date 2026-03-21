@@ -170,7 +170,7 @@ async def test_concurrent_payment_unsafe_both_succeed():
     Это подтверждает, что проблема не в ошибках, а в race condition.
     """
     # TODO: Реализовать проверку успешности обеих транзакций
-    pass # ??
+    pass
 
 
 if __name__ == "__main__":
